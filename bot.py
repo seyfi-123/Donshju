@@ -9,16 +9,20 @@ if not TOKEN:
     raise ValueError("TELEGRAM_TOKEN muhit o'zgaruvchisi topilmadi!")
 
 bot = telebot.TeleBot(TOKEN)
-app = OmniMind(db_path="omnimind.db")
 
-# SQLite thread xatosini oldini olish uchun qulf (Lock) yaratamiz
+# Baza bilan ishlash uchun qulf
 db_lock = threading.Lock()
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     chat_id = message.chat.id
+    user_id = str(message.from_user.id)
+    
     with db_lock:
-        app.set_student(str(message.from_user.id))
+        # Har safar alohida obyekt ochamiz, shunda thread muammosi chiqmaydi
+        app = OmniMind(db_path="omnimind.db")
+        app.set_student(user_id)
+        
     bot.reply_to(message, f"Salom! OmniMind AI botiga xush kelibsiz. Sizning Chat ID raqamingiz: {chat_id}\nSavolingizni yozishingiz mumkin.")
 
 @bot.message_handler(commands=['help'])
@@ -38,8 +42,11 @@ def handle_message(message):
     
     try:
         with db_lock:
+            # Har bir xabar uchun yangi OmniMind ulanishi
+            app = OmniMind(db_path="omnimind.db")
             app.set_student(user_id)
             answer, task = app.lesson(text)
+            
         bot.reply_to(message, answer)
     except Exception as e:
         bot.reply_to(message, f"Xato yuz berdi: {e}")
