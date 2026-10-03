@@ -1,0 +1,952 @@
+#!/usr/bin/env python3
+"""
+OmniMind v3 — муаллими бисёрмоделӣ (аз синфи 1 то докторӣ).
+
+Имкониятҳо:
+  • хотираи SQLite (саволҳо, мавзӯъҳо, хатоҳо, дараҷаи азхудкунӣ)
+  • мини-санҷиш пас аз ҳар дарс ва кор бо хатоҳо
+  • санҷиши математика бо sympy
+  • дараҷаҳо: синфи 1-11, бакалавр, магистр, PhD
+  • тарҷумони забонҳо: тоҷикӣ, русӣ, ӯзбекӣ, англисӣ
+  • ТАНЗИМОТ БЕ ТАҒЙИРИ КОД: engines.json, levels.json, prompts.json
+    (дафъаи аввал худи барнома онҳоро месозад; танҳо онҳоро таҳрир кунед)
+
+Насб:      pip install requests sympy
+Калидҳо:   ANTHROPIC_API_KEY / DEEPSEEK_API_KEY / GEMINI_API_KEY / GROQ_API_KEY ...
+           (ақаллан яктоаш; барои овоз: OPENAI_API_KEY)
+Оғоз:      python omnimind.py --student Алӣ
+           python omnimind.py "x^2-5x+6=0" --level 8 --quiz
+           python omnimind.py --audio савол.mp3
+
+Фармонҳо дар реҷаи мубодилавӣ:
+  /санҷиш [фанн/мавзӯъ]   мини-санҷиш       /такрор       мавзӯи такрорӣ
+  /пешрафт                азхудкунӣ         /забон ru     забони ҷавоб (tg/ru/uz/en)
+  /дараҷа 3 | bakalavr    дараҷаи хонанда   /хонанда Ном  иваз кардани хонанда
+  /баромад                баромадан
+"""
+import argparse
+import json
+import logging
+import os
+import re
+import sqlite3
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+
+import requests
+
+try:
+    import sympy as sp
+    from sympy.parsing.sympy_parser import (convert_xor, implicit_multiplication_application,
+                                            parse_expr, standard_transformations)
+    HAVE_SYMPY = True
+except ImportError:  # sympy ихтиёрӣ аст
+    HAVE_SYMPY = False
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("omnimind")
+TIMEOUT = 90
+CONFIG_DIR = os.getenv("OMNIMIND_DIR", os.path.dirname(os.path.abspath(__file__)))
+
+LANG_NAMES = {"tg": "Tajik (Cyrillic script)", "ru": "Russian", "uz": "Uzbek (Cyrillic script)",
+              "en": "English"}
+
+# Матнҳои интерфейс ба забони хонанда (барои хонандаи тоҷик — tg)
+UI = {
+    "tg": {"offer": "Мини-санҷиш мегузаронем? (ҳа/не)", "ok": "✅ Дуруст!", "bad": "❌ Нодуруст.",
+           "right": "Ҷавоби дуруст", "score": "Натиҷа: {}/{}", "hint": "(ҷавоб нависед, гузаштан: '-')",
+           "nothing": "Ҳоло чизе барои такрор нест.", "mastery": "Азхудкунӣ"},
+    "ru": {"offer": "Пройдём мини-тест? (да/нет)", "ok": "✅ Верно!", "bad": "❌ Неверно.",
+           "right": "Правильно", "score": "Результат: {}/{}", "hint": "(пишите ответ, пропуск: '-')",
+           "nothing": "Пока нечего повторять.", "mastery": "Усвоение"},
+    "uz": {"offer": "Мини-тест ечамизми? (ҳа/йўқ)", "ok": "✅ Тўғри!", "bad": "❌ Нотўғри.",
+           "right": "Тўғриси", "score": "Натижа: {}/{}", "hint": "(жавоб ёзинг, ўтказиш: '-')",
+           "nothing": "Такрорлаш керак мавзу йўқ.", "mastery": "Ўзлаштириш"},
+    "en": {"offer": "Take a mini-quiz? (yes/no)", "ok": "✅ Correct!", "bad": "❌ Wrong.",
+           "right": "Correct answer", "score": "Score: {}/{}", "hint": "(type answer, skip: '-')",
+           "nothing": "Nothing to review yet.", "mastery": "Mastery"},
+}
+YES = {"ҳа", "ха", "да", "бале", "y", "yes", "ok", "da"}
+
+# Тасниф: фанн -> мавзӯъҳо (модел аз ҳамин ҷо интихоб мекунад)
+TAXONOMY = {
+    "math": ["arithmetic", "fractions", "linear_equations", "quadratic_equations", "inequalities",
+             "functions", "sequences", "trigonometry", "plane_geometry", "solid_geometry",
+             "limits", "derivatives", "integrals", "probability_combinatorics",
+             "linear_algebra", "differential_equations"],
+    "russian": ["phonetics", "stress", "spelling", "morphology", "cases", "verbs", "syntax",
+                "punctuation", "vocabulary", "speech"],
+    "english": ["present_simple", "past_simple", "future", "perfect_tenses", "articles",
+                "modal_verbs", "conditionals", "passive_voice", "vocabulary", "pronunciation"],
+    "tajik": ["grammar", "spelling", "vocabulary"],
+    "uzbek": ["grammar", "spelling", "vocabulary"],
+    "physics": [], "chemistry": [], "biology": [], "history": [], "code": [], "other": [],
+}
+LANG_SUBJECTS = {"russian", "english", "tajik", "uzbek"}
+
+# ───────────────────────── Танзимоти пешфарз (ба файл навишта мешаванд) ─────────────────────────
+DEFAULT_ENGINES = [
+    {"name": "Claude", "kind": "anthropic", "model": "claude-sonnet-5-5", "model_env": "ANTHROPIC_MODEL",
+     "key_env": "ANTHROPIC_API_KEY", "strengths": ["analysis", "language", "writing"], "enabled": True},
+    {"name": "DeepSeek", "kind": "openai_compat", "model": "deepseek-chat", "model_env": "DEEPSEEK_MODEL",
+     "key_env": "DEEPSEEK_API_KEY", "url": "https://api.deepseek.com/chat/completions",
+     "strengths": ["math", "logic", "code"], "enabled": True},
+    {"name": "Gemini", "kind": "gemini", "model": "gemini-2.5-flash", "model_env": "GEMINI_MODEL",
+     "key_env": "GEMINI_API_KEY", "strengths": ["general", "language"], "enabled": True},
+    {"name": "Groq", "kind": "openai_compat", "model": "", "model_env": "GROQ_MODEL",
+     "key_env": "GROQ_API_KEY", "url": "https://api.groq.com/openai/v1/chat/completions",
+     "strengths": ["math", "logic"], "enabled": True},
+    {"name": "OpenRouter", "kind": "openai_compat", "model": "", "model_env": "OPENROUTER_MODEL",
+     "key_env": "OPENROUTER_API_KEY", "url": "https://openrouter.ai/api/v1/chat/completions",
+     "strengths": ["general"], "enabled": True},
+    {"name": "Mistral", "kind": "openai_compat", "model": "", "model_env": "MISTRAL_MODEL",
+     "key_env": "MISTRAL_API_KEY", "url": "https://api.mistral.ai/v1/chat/completions",
+     "strengths": ["language", "general"], "enabled": True},
+]
+
+
+def _default_levels():
+    def grade(g):
+        if g <= 4:
+            return ("Бо калимаҳои хеле оддӣ ва ҷумлаҳои кӯтоҳ шарҳ деҳ. Мисолҳо аз ҳаёти ҳаррӯза "
+                    "(мева, бозича, ширинӣ). Ҳар қадамро алоҳида нишон деҳ. Истилоҳҳои душворро нагӯй.")
+        if g <= 6:
+            return ("Оддӣ ва равшан шарҳ деҳ. Истилоҳҳоро бо мисол фаҳмон, қадам ба қадам пеш рав.")
+        if g <= 9:
+            return ("Қоида ва формулаҳоро ном бибар ва асоснок кун. Мисолҳои стандартии китоби "
+                    "дарсӣ ва як-ду масъалаи ҷиддитар деҳ.")
+        return ("Дақиқ ва бо истилоҳҳои илмӣ ҷавоб деҳ. Масъалаҳои сатҳи имтиҳони вурудӣ, "
+                "якчанд усули ҳал ва хатогиҳои маъмулро нишон деҳ.")
+
+    levels = [{"id": f"sinf{g}", "name": f"Синфи {g}", "rules": grade(g)} for g in range(1, 12)]
+    levels += [
+        {"id": "bakalavr", "name": "Бакалавр",
+         "rules": "Сатҳи донишгоҳӣ: таърифҳои дақиқ, исботи кӯтоҳ, формулаҳо ва мисолҳои мураккаб."},
+        {"id": "magistr", "name": "Магистр",
+         "rules": "Сатҳи магистрӣ: чуқур, бо исботҳо, ҳолатҳои махсус ва ишора ба назарияҳои асосӣ."},
+        {"id": "phd", "name": "Докторӣ (PhD)",
+         "rules": "Сатҳи илмии докторӣ: дақиқии баланд, баррасии методӣ ва маҳдудиятҳо. Номи китоб, "
+                  "мақола ё муаллифро аз худ тӯқ накун; агар боварӣ надорӣ, ошкоро бинвис, ки "
+                  "бояд тафтиш шавад."},
+    ]
+    return levels
+
+
+DEFAULT_PROMPTS = {
+    "analyze": (
+        "Ту таҳлилгари дархост ҳастӣ. ФАҚАТ JSON баргардон: "
+        '{"clean_query": "саволи аниқ ва аз хатоҳои гуфтугӯӣ тоза", '
+        '"language": "забони ҷавоб: tg|ru|uz|en", '
+        '"level": "яке аз: {LEVELS}", '
+        '"subject": "<фанн аз тасниф>", "topic": "<мавзӯъ аз тасниф ё slug-и нави англисӣ>"}. '
+        "Тасниф (фанн: мавзӯъҳо): {TAXONOMY}. Забони ҷавоб ҳамон забонест, ки савол бо он навишта шудааст."),
+    "worker": (
+        "Ту коршиноси илмҳои аниқ ва забонҳо ҳастӣ. Танҳо ба далелҳои санҷидашуда такя кун; "
+        "агар намедонӣ, 'намедонам' бигӯ ва чизе аз худат нагӯй. Забони ҷавоб: {language}. "
+        "Дараҷаи хонанда: {level_name}. Фанн: {subject}, мавзӯъ: {topic}.\n"
+        "ҚОИДАҲОИ ДАРАҶА: {level_rules}\n{rules}\n"
+        "ШАРТИ ҲАТМӢ: ҳадди ақал 2 мисоли ҳалшуда бо қадамҳо ва шарҳи ҳар қадам овар.\n\n"
+        "ХОТИРАИ ХОНАНДА:\n{profile}\n"
+        "Ба суҳбатҳои пешин ва хатоҳо такя кун: такрор накун, ба донистаҳои хонанда бино кун, "
+        "хатояшро ошкоро ислоҳ намо."),
+    "judge": (
+        "Ту санҷандаи асосӣ ҳастӣ. Ту ҷавобҳои якчанд моделро мегирӣ. Вазифаи ту:\n"
+        "1) Зиддиятҳои байни ҷавобҳоро ёб ва ҷавоби дурустро бо мантиқ ё ҳисоб муайян кун;\n"
+        "2) Агар 'НАТИҶАИ SYMPY' дода шуда бошад, он ҳисоби компютерист ва аз моделҳо болотар аст; "
+        "агар модел бо он мухолиф бошад, моделро ислоҳ кун ва инро бигӯ;\n"
+        "3) Хатоҳо ва даъвоҳои санҷиданашавандаро хориҷ кун;\n"
+        "4) Як ҷавоби ниҳоии аниқ бинвис — бо забони {language}, барои дараҷаи '{level_name}'. "
+        "{level_rules}\n"
+        "5) Агар омӯзиши забон бошад: талаффуз, қоидаи грамматика, таъкид (урғу) ва 3-5 мисол деҳ;\n"
+        "6) Ҳадди ақал 2 мисоли ҳалшуда бо қадамҳо дар ҷавоб бошад;\n"
+        "7) Ба хотираи хонанда мувофиқ бош:\n{profile}\n"
+        "8) Дар охир сатри 'Эътимоднокӣ:' — баланд/миёна/паст ва сабаби кӯтоҳ. "
+        "Агар ихтилоф бошад, ошкоро бигӯ."),
+    "math": (
+        "Масъалаи математикиро ба шакле биёр, ки sympy ҳисоб карда тавонад. ФАҚАТ JSON: "
+        '{"tasks":[{"kind":"solve|simplify|factor|expand|diff|integrate|limit|evaluate",'
+        '"expr":"бо синтаксиси sympy (x**2-5*x+6=0; системаи муодилаҳо бо ; ҷудо мешавад)",'
+        '"var":"x","point":"нуқтаи лимит (oo мумкин)","lower":"","upper":""}]}. '
+        'Агар масъала ҳисобшаванда набошад: {"tasks":[]}. Танҳо ифодаи тоза, бе калимаҳои иловагӣ.'),
+    "quiz": (
+        "Ту муаллим ҳастӣ. ФАҚАТ JSON баргардон: "
+        '{"questions":[{"q":"савол","a":"ҷавоби дурусти кӯтоҳ","explain":"шарҳи 1-2 ҷумла"}]}. '
+        "Шумораи саволҳо n, бо забон ва дараҷаи додашуда, аз рӯи мавзӯъ, душвориҳои гуногун. "
+        "Агар past_mistakes мавҷуд бошад, ақаллан нисфи саволҳо ба ин хатоҳо монанд бошанд. "
+        "Ҷавобҳо кӯтоҳ бошанд (адад, ифода ё калима). Дар математика 'a'-ро бо синтаксиси sympy "
+        "бинвис (x**2, 2*x+1; чанд ҷавоб бо вергул: 2, 3). Дар саволҳои забон 'a' — як калима ё шакли аниқ."),
+    "grade": (
+        "Ҷавоби хонандаро санҷ. Вурудӣ: JSON {q, expected, given}. ФАҚАТ JSON: "
+        '{"correct":true,"right_answer":"...","explanation":"кӯтоҳ"}. '
+        "Агар аз рӯи маъно дуруст бошад (синоним, фарқи хурди имло), correct=true; "
+        "агар савол дар бораи имло бошад, сахтгир бош."),
+    "remediate": (
+        "Хонанда дар санҷиш хато кард. Вурудӣ: рӯйхати JSON {q, given, right}. Бо забони {language}: "
+        "ҳар хаторо дар 1-2 ҷумла фаҳмон (чаро хато ва қоида чист), сипас нақшаи 2-3 қадамаи "
+        "кӯтоҳ деҳ. Кӯтоҳ ва аниқ бош."),
+    "rules_math": (
+        "Ҳалро қадам ба қадам бинвис, ҳар табдилро асоснок кун ва дар охир ҷавобро тафтиш намо "
+        "(ҷойгузорӣ). Формулаҳоро дақиқ нависед."),
+    "rules_language": (
+        "Ин — омӯзиши забон. Шарҳро бо забони хонанда деҳ, мисолҳо ва тарҷумаро бо забони "
+        "омӯхташаванда биёр. Талаффузро (транскрипсия) нависед. Дар забони русӣ: дар ҳар калимаи "
+        "мисол таъкид (ударение)-ро бо аломат нишон деҳ (а́), ҷадвали падеж ё шахсро биёр, "
+        "қоида ва истисноҳоро ҷудо кун."),
+}
+
+
+def load_json(name, default):
+    """Файли танзимотро мехонад; агар набошад, пешфарзро месозад."""
+    path = os.path.join(CONFIG_DIR, name)
+    if not os.path.exists(path):
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(default, f, ensure_ascii=False, indent=2)
+            log.info("Файли танзимот сохта шуд: %s", path)
+        except OSError as e:
+            log.warning("Файл сохта нашуд (%s): %s", path, e)
+        return default
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError) as e:
+        log.warning("%s хонда нашуд (%s) — пешфарз истифода мешавад.", name, e)
+        return default
+
+
+def fill(template, **kw):
+    """Ҷойгузории бехатари {калид} (бе .format, то ки қавсҳои JSON нашикананд)."""
+    for k, v in kw.items():
+        template = template.replace("{" + k + "}", str(v))
+    return template
+
+
+# ───────────────────────── 1. Муҳаррикҳо (API-и расмӣ) ─────────────────────────
+@dataclass
+class Engine:
+    name: str
+    kind: str                      # anthropic | openai_compat | gemini
+    model: str
+    key_env: str
+    url: str = ""
+    strengths: tuple = ()
+    fail_count: int = 0
+    cooldown_until: float = 0.0
+    stats: dict = field(default_factory=lambda: {"ok": 0, "fail": 0})
+
+    @property
+    def api_key(self):
+        return os.getenv(self.key_env, "")
+
+    def configured(self):
+        return bool(self.api_key and self.model)
+
+    def available(self):
+        return self.configured() and time.time() >= self.cooldown_until
+
+    def _mark_fail(self):
+        self.fail_count += 1
+        self.stats["fail"] += 1
+        if self.fail_count >= 3:  # 3 хатои пайдарпай — 60 сония хомӯш
+            self.cooldown_until = time.time() + 60
+            self.fail_count = 0
+            log.warning("%s барои 60 сония хомӯш шуд (хатоҳои пайдарпай)", self.name)
+
+    def ask(self, system, user, retries=2):
+        last = None
+        for attempt in range(retries + 1):
+            try:
+                text = self._call(system, user)
+                self.fail_count = 0
+                self.stats["ok"] += 1
+                return text
+            except Exception as e:  # noqa: BLE001
+                last = e
+                self._mark_fail()
+                time.sleep(1.5 * (attempt + 1))
+        raise RuntimeError(f"{self.name}: {last}")
+
+    def _call(self, system, user):
+        if self.kind == "anthropic":
+            r = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": self.api_key, "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={"model": self.model, "max_tokens": 3000, "system": system,
+                      "messages": [{"role": "user", "content": user}]}, timeout=TIMEOUT)
+            r.raise_for_status()
+            return "".join(b.get("text", "") for b in r.json()["content"])
+        if self.kind == "openai_compat":
+            r = requests.post(
+                self.url, headers={"Authorization": f"Bearer {self.api_key}"},
+                json={"model": self.model, "temperature": 0.2,
+                      "messages": [{"role": "system", "content": system},
+                                   {"role": "user", "content": user}]}, timeout=TIMEOUT)
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"]
+        if self.kind == "gemini":
+            r = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent",
+                headers={"x-goog-api-key": self.api_key},
+                json={"systemInstruction": {"parts": [{"text": system}]},
+                      "contents": [{"role": "user", "parts": [{"text": user}]}],
+                      "generationConfig": {"temperature": 0.2}}, timeout=TIMEOUT)
+            r.raise_for_status()
+            return "".join(p.get("text", "") for p in r.json()["candidates"][0]["content"]["parts"])
+        raise ValueError(f"Навъи номаълум: {self.kind}")
+
+
+def build_engines(cfg):
+    engines = []
+    for c in cfg:
+        if not c.get("enabled", True):
+            continue
+        model = os.getenv(c.get("model_env", ""), "") or c.get("model", "")
+        engines.append(Engine(name=c["name"], kind=c["kind"], model=model, key_env=c["key_env"],
+                              url=c.get("url", ""), strengths=tuple(c.get("strengths", []))))
+    return engines
+
+
+# ───────────────────────── 2. Ёрирасонҳо ─────────────────────────
+def extract_json(text):
+    """Объект ё рӯйхати JSON-ро аз дохили матн мебарорад."""
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.M).strip()
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    for pat in (r"\{.*\}", r"\[.*\]"):
+        m = re.search(pat, text, re.S)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except ValueError:
+                continue
+    raise ValueError("JSON ёфт нашуд")
+
+
+def slug(s, default="general"):
+    return re.sub(r"[^a-z0-9_]+", "_", str(s).lower()).strip("_") or default
+
+
+def detect_lang(text):
+    if re.search(r"[ӣӯҷ]", text, re.I):
+        return "tg"
+    if re.search(r"[ў]", text, re.I):
+        return "uz"
+    if re.search(r"[қғҳ]", text, re.I):
+        return "tg"  # ҷойи корбарӣ — Тоҷикистон
+    if re.search(r"[а-яё]", text, re.I):
+        return "ru"
+    return "en"
+
+
+FALLBACK_RULES = [
+    (r"интеграл|∫|integral", "math", "integrals"),
+    (r"ҳосила|хосила|производн|derivative|d/dx", "math", "derivatives"),
+    (r"лимит|предел|limit", "math", "limits"),
+    (r"квадрат", "math", "quadratic_equations"),
+    (r"муодила|тенглама|уравнени|equation|=", "math", "linear_equations"),
+    (r"sin|cos|tan|тригоном", "math", "trigonometry"),
+    (r"present simple", "english", "present_simple"),
+    (r"past simple", "english", "past_simple"),
+    (r"ударени|таъкид|урғу", "russian", "stress"),
+    (r"падеж|келишик", "russian", "cases"),
+]
+
+
+def fallback_topic(text):
+    for pat, subj, topic in FALLBACK_RULES:
+        if re.search(pat, text, re.I):
+            return subj, topic
+    return ("math", "arithmetic") if re.search(r"\d\s*[-+*/^]\s*\d", text) else ("other", "general")
+
+
+def transcribe_audio(path):
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError("Барои овоз OPENAI_API_KEY лозим аст (ё матн ворид кунед).")
+    with open(path, "rb") as f:
+        r = requests.post("https://api.openai.com/v1/audio/transcriptions",
+                          headers={"Authorization": f"Bearer {key}"},
+                          files={"file": f}, data={"model": "whisper-1"}, timeout=180)
+    r.raise_for_status()
+    return r.json()["text"]
+
+
+# ───────────────────────── 3. SymPy — санҷиши математика ─────────────────────────
+SAFE_RE = re.compile(r"^[0-9A-Za-z_+\-*/^().,\s=<>!]*$")
+ALLOWED = ["sin", "cos", "tan", "cot", "sec", "csc", "asin", "acos", "atan", "sinh", "cosh", "tanh",
+           "exp", "log", "sqrt", "pi", "E", "oo", "Abs", "factorial"]
+
+
+def safe_parse(s):
+    """Ифодаи аз модел гирифташударо ба объекти бехатари sympy табдил медиҳад."""
+    s = s.strip()
+    if len(s) > 200 or not SAFE_RE.match(s) or "__" in s:
+        raise ValueError("Ифода иҷозат нест")
+    local = {n: getattr(sp, n) for n in ALLOWED}
+    local["ln"] = sp.log
+    glob = {"__builtins__": {}, "Symbol": sp.Symbol, "Integer": sp.Integer, "Float": sp.Float,
+            "Rational": sp.Rational, "Function": sp.Function, "factorial": sp.factorial}
+    tr = standard_transformations + (implicit_multiplication_application, convert_xor)
+    return parse_expr(s, local_dict=local, global_dict=glob, transformations=tr)
+
+
+def _to_relation(s):
+    parts = re.split(r"(?<![<>!=])=(?!=)", s)
+    if len(parts) == 2:
+        return sp.Eq(safe_parse(parts[0]), safe_parse(parts[1]))
+    return safe_parse(s)
+
+
+def sympy_run(spec):
+    """spec: {kind, expr, var, point, lower, upper} → {ok, kind, input, result}"""
+    if not HAVE_SYMPY:
+        return None
+    try:
+        kind = str(spec.get("kind", "")).lower()
+        expr = str(spec.get("expr", ""))
+        var = sp.Symbol(spec.get("var") or "x")
+        if kind == "solve":
+            eqs = [_to_relation(p) for p in expr.split(";") if p.strip()]
+            res = sp.solve(eqs, dict=True) if len(eqs) > 1 else sp.solve(eqs[0], var)
+        elif kind == "simplify":
+            res = sp.simplify(safe_parse(expr))
+        elif kind == "factor":
+            res = sp.factor(safe_parse(expr))
+        elif kind == "expand":
+            res = sp.expand(safe_parse(expr))
+        elif kind == "diff":
+            res = sp.diff(safe_parse(expr), var)
+        elif kind == "integrate":
+            f = safe_parse(expr)
+            if spec.get("lower") not in (None, "") and spec.get("upper") not in (None, ""):
+                res = sp.integrate(f, (var, safe_parse(str(spec["lower"])),
+                                       safe_parse(str(spec["upper"]))))
+            else:
+                res = str(sp.integrate(f, var)) + " + C"
+        elif kind == "limit":
+            res = sp.limit(safe_parse(expr), var, safe_parse(str(spec.get("point", "0"))))
+        elif kind == "evaluate":
+            val = safe_parse(expr)
+            res = sp.simplify(val)
+            if not res.is_Integer:
+                res = f"{res}  ≈ {sp.N(res, 10)}"
+        else:
+            return None
+        return {"ok": True, "kind": kind, "input": expr, "result": str(res)}
+    except Exception as e:  # noqa: BLE001
+        log.info("sympy кор накард (%s): %s", spec, e)
+        return None
+
+
+def _norm_answer(s):
+    s = re.sub(r"(?i)\b[a-z]\s*=\s*", "", s)
+    return [p for p in re.split(r"[;,]", s) if p.strip()]
+
+
+def answers_equal(a, b):
+    """True/False — муқоиса шуд; None — бо sympy муқоиса карда нашуд."""
+    if not HAVE_SYMPY:
+        return None
+    try:
+        A = [safe_parse(p) for p in _norm_answer(a)]
+        B = [safe_parse(p) for p in _norm_answer(b)]
+        if not A or not B:
+            return None
+        if len(A) != len(B):
+            return False
+        rest = list(B)
+        for x in A:
+            for y in rest:
+                if sp.simplify(x - y) == 0:
+                    rest.remove(y)
+                    break
+            else:
+                return False
+        return True
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# ───────────────────────── 4. Хотира (SQLite) ─────────────────────────
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS students(name TEXT PRIMARY KEY, lang TEXT, level TEXT DEFAULT '', created REAL);
+CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT, student TEXT, ts REAL,
+    role TEXT, text TEXT, subject TEXT, topic TEXT);
+CREATE TABLE IF NOT EXISTS topics(student TEXT, subject TEXT, topic TEXT, mastery REAL,
+    attempts INTEGER, correct INTEGER, lessons INTEGER, last_seen REAL,
+    PRIMARY KEY(student, subject, topic));
+CREATE TABLE IF NOT EXISTS mistakes(id INTEGER PRIMARY KEY AUTOINCREMENT, student TEXT, subject TEXT,
+    topic TEXT, question TEXT, given TEXT, right TEXT, explanation TEXT, ts REAL,
+    resolved INTEGER DEFAULT 0);
+CREATE INDEX IF NOT EXISTS ix_msg ON messages(student, topic, id);
+"""
+
+
+class Memory:
+    def __init__(self, path="omnimind.db"):
+        self.db = sqlite3.connect(path)
+        self.db.row_factory = sqlite3.Row
+        self.db.executescript(SCHEMA)
+        try:  # гузариш аз версияи 2: сутуни level илова мешавад
+            self.db.execute("ALTER TABLE students ADD COLUMN level TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+        self.db.commit()
+
+    def _x(self, sql, args=()):
+        cur = self.db.execute(sql, args)
+        self.db.commit()
+        return cur
+
+    def student(self, name):
+        r = self._x("SELECT * FROM students WHERE name=?", (name,)).fetchone()
+        if r:
+            return dict(r)
+        self._x("INSERT INTO students(name, lang, level, created) VALUES(?,?,?,?)",
+                (name, "", "", time.time()))
+        return {"name": name, "lang": "", "level": ""}
+
+    def set_lang(self, name, lang):
+        self._x("UPDATE students SET lang=? WHERE name=?", (lang, name))
+
+    def set_level(self, name, level):
+        self._x("UPDATE students SET level=? WHERE name=?", (level, name))
+
+    def add_message(self, student, role, text, subject="", topic=""):
+        self._x("INSERT INTO messages(student, ts, role, text, subject, topic) VALUES(?,?,?,?,?,?)",
+                (student, time.time(), role, text, subject, topic))
+
+    def touch_topic(self, student, subject, topic):
+        self._x("""INSERT INTO topics(student, subject, topic, mastery, attempts, correct, lessons, last_seen)
+                   VALUES(?,?,?,0.5,0,0,1,?)
+                   ON CONFLICT(student, subject, topic)
+                   DO UPDATE SET lessons=lessons+1, last_seen=excluded.last_seen""",
+                (student, subject, topic, time.time()))
+
+    def record_result(self, student, subject, topic, correct):
+        self._x("""INSERT OR IGNORE INTO topics(student, subject, topic, mastery, attempts, correct,
+                   lessons, last_seen) VALUES(?,?,?,0.5,0,0,0,?)""",
+                (student, subject, topic, time.time()))
+        self._x("""UPDATE topics SET mastery=0.7*mastery+0.3*?, attempts=attempts+1, correct=correct+?,
+                   last_seen=? WHERE student=? AND subject=? AND topic=?""",
+                (1.0 if correct else 0.0, 1 if correct else 0, time.time(), student, subject, topic))
+
+    def topic_row(self, student, subject, topic):
+        r = self._x("SELECT * FROM topics WHERE student=? AND subject=? AND topic=?",
+                    (student, subject, topic)).fetchone()
+        return dict(r) if r else None
+
+    def all_topics(self, student):
+        return [dict(r) for r in self._x(
+            "SELECT * FROM topics WHERE student=? ORDER BY subject, mastery", (student,))]
+
+    def due_topics(self, student):
+        now, due = time.time(), []
+        for t in self.all_topics(student):
+            age_days = (now - t["last_seen"]) / 86400
+            if t["mastery"] < 0.6 or age_days > 2 + 10 * t["mastery"]:
+                due.append(t)
+        return sorted(due, key=lambda t: t["mastery"])
+
+    def add_mistake(self, student, subject, topic, question, given, right, explanation):
+        self._x("""INSERT INTO mistakes(student, subject, topic, question, given, right, explanation, ts)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (student, subject, topic, question, given, right, explanation, time.time()))
+
+    def open_mistakes(self, student, topic=None, limit=5):
+        sql, args = "SELECT * FROM mistakes WHERE student=? AND resolved=0", [student]
+        if topic:
+            sql += " AND topic=?"
+            args.append(topic)
+        sql += " ORDER BY id DESC LIMIT ?"
+        args.append(limit)
+        return [dict(r) for r in self._x(sql, args)]
+
+    def resolve_one(self, student, topic):
+        r = self._x("SELECT id FROM mistakes WHERE student=? AND topic=? AND resolved=0 "
+                    "ORDER BY id LIMIT 1", (student, topic)).fetchone()
+        if r:
+            self._x("UPDATE mistakes SET resolved=1 WHERE id=?", (r["id"],))
+
+    def history(self, student, topic=None, n=4):
+        if topic:
+            rows = self._x("SELECT role, text FROM messages WHERE student=? AND topic=? "
+                           "ORDER BY id DESC LIMIT ?", (student, topic, n))
+        else:
+            rows = self._x("SELECT role, text FROM messages WHERE student=? ORDER BY id DESC LIMIT ?",
+                           (student, n))
+        return [(r["role"], r["text"][:350]) for r in reversed(list(rows))]
+
+    def profile(self, student, subject, topic):
+        """Хотираи хонанда барои модел: дараҷаи мавзӯъ, суҳбати пешин, хатоҳо."""
+        lines, row = [], self.topic_row(student, subject, topic)
+        if row:
+            m = row["mastery"]
+            style = ("хеле оддӣ, қадамҳои хурд, мисолҳои бисёр" if m < 0.4 else
+                     "миёна: такрори кӯтоҳ + қисми нав" if m < 0.75 else
+                     "чуқуртар: мисолҳои мураккаб ва исбот")
+            lines.append(f"Мавзӯи '{topic}': азхудкунӣ {m:.0%}, {row['lessons']} дарс, "
+                         f"санҷиш {row['correct']}/{row['attempts']}. Услуб: {style}.")
+        else:
+            lines.append(f"Мавзӯи '{topic}' барои хонанда нав аст — аз асос оғоз кун.")
+        hist = self.history(student, topic, 4)
+        if hist:
+            lines.append("Суҳбати пешин дар ҳамин мавзӯъ (кӯтоҳ):\n" +
+                         "\n".join(f"- {r}: {t}" for r, t in hist))
+        mist = self.open_mistakes(student, topic, 3)
+        if mist:
+            lines.append("Хатоҳои ҳалнашуда: " + "; ".join(
+                f"савол «{m['question']}», навишт «{m['given']}», дуруст «{m['right']}»" for m in mist))
+        weak = [t for t in self.all_topics(student)
+                if t["attempts"] > 0 and t["mastery"] < 0.6 and t["topic"] != topic][:3]
+        if weak:
+            lines.append("Мавзӯъҳои заиф: " + ", ".join(
+                f"{t['subject']}/{t['topic']} ({t['mastery']:.0%})" for t in weak))
+        return "\n".join(lines)
+
+
+# ───────────────────────── 5. Низоми марказӣ ─────────────────────────
+class OmniMind:
+    def __init__(self, db_path="omnimind.db", student="default", level_override=""):
+        self.engines = build_engines(load_json("engines.json", DEFAULT_ENGINES))
+        self.levels = load_json("levels.json", _default_levels())
+        self.levels_by_id = {lv["id"]: lv for lv in self.levels}
+        self.prompts = {**DEFAULT_PROMPTS, **load_json("prompts.json", DEFAULT_PROMPTS)}
+        active = [e.name for e in self.engines if e.configured()]
+        if not active:
+            raise SystemExit("Ягон калиди API (ва номи модел) ёфт нашуд. engines.json-ро кушоед "
+                             "ва ANTHROPIC_API_KEY / DEEPSEEK_API_KEY / GEMINI_API_KEY-ро гузоред.")
+        log.info("Муҳаррикҳои фаъол: %s | sympy: %s", ", ".join(active), HAVE_SYMPY)
+        self.mem = Memory(db_path)
+        self.student = student
+        self.mem.student(student)
+        if level_override:
+            self.set_level(level_override)
+        self.last = None
+
+    # — муҳаррикҳо
+    def _live(self):
+        return [e for e in self.engines if e.available()]
+
+    def _ask_any(self, system, user, prefer=None):
+        engines = self._live()
+        engines.sort(key=lambda e: (prefer not in e.strengths, e.stats["fail"]))
+        for e in engines:
+            try:
+                return e.ask(system, user)
+            except Exception as ex:  # noqa: BLE001
+                log.warning("%s", ex)
+        raise RuntimeError("Ҳамаи муҳаррикҳо ҷавоб надоданд.")
+
+    def set_student(self, name):
+        self.student = name
+        self.mem.student(name)
+        self.last = None
+
+    def lang(self, override=""):
+        return override or self.mem.student(self.student)["lang"]
+
+    # — дараҷа
+    def parse_level(self, arg):
+        a = arg.strip().lower()
+        if a.isdigit() and 1 <= int(a) <= 11:
+            return f"sinf{int(a)}"
+        m = re.match(r"(?:sinf|синф\w*)\s*(\d+)", a)
+        if m and 1 <= int(m.group(1)) <= 11:
+            return f"sinf{int(m.group(1))}"
+        aliases = {"бакалавр": "bakalavr", "магистр": "magistr", "доктор": "phd", "докторӣ": "phd"}
+        a = aliases.get(a, a)
+        return a if a in self.levels_by_id else ""
+
+    def set_level(self, arg):
+        lid = self.parse_level(arg)
+        if not lid:
+            return False
+        self.mem.set_level(self.student, lid)
+        return True
+
+    def level_list(self):
+        return ", ".join(f"{lv['id']} ({lv['name']})" for lv in self.levels)
+
+    # — 1: таҳлил, муайян кардани мавзӯъ
+    def analyze(self, raw, lang_pref=""):
+        meta = {}
+        try:
+            sysmsg = fill(self.prompts["analyze"], TAXONOMY=json.dumps(TAXONOMY, ensure_ascii=False),
+                          LEVELS="|".join(self.levels_by_id))
+            meta = extract_json(self._ask_any(sysmsg, raw, prefer="language"))
+            if not isinstance(meta, dict):
+                meta = {}
+        except Exception as ex:  # noqa: BLE001
+            log.warning("Таҳлил нашуд (%s) — муайянкунии қоидавӣ.", ex)
+        fb_subj, fb_topic = fallback_topic(raw)
+        subject = slug(meta.get("subject") or fb_subj, "other")
+        if subject not in TAXONOMY:
+            subject = "other"
+        lang = lang_pref or meta.get("language") or detect_lang(raw)
+        # дараҷа: аввал хонанда худаш интихоб кардааст, акс ҳол — тахмини модел
+        level = self.mem.student(self.student)["level"]
+        if level not in self.levels_by_id:
+            level = meta.get("level") if meta.get("level") in self.levels_by_id else "bakalavr"
+        return {"original": raw, "clean_query": meta.get("clean_query") or raw.strip(),
+                "language": lang if lang in LANG_NAMES else detect_lang(raw),
+                "level": level, "subject": subject, "topic": slug(meta.get("topic") or fb_topic)}
+
+    # — санҷиши математика
+    def verify_math(self, task):
+        if not HAVE_SYMPY:
+            return []
+        try:
+            spec = extract_json(self._ask_any(self.prompts["math"], task["clean_query"], prefer="math"))
+            tasks = spec.get("tasks", []) if isinstance(spec, dict) else []
+        except Exception as ex:  # noqa: BLE001
+            log.info("Баровардани ифодаи математикӣ нашуд: %s", ex)
+            return []
+        out = [r for r in (sympy_run(t) for t in tasks[:4]) if r]
+        if out:
+            log.info("sympy: %s", out)
+        return out
+
+    def _subject_rules(self, subject):
+        if subject == "math":
+            return self.prompts["rules_math"]
+        return self.prompts["rules_language"] if subject in LANG_SUBJECTS else ""
+
+    # — 2: тақсим ба моделҳои коргар
+    def dispatch(self, task):
+        lv = self.levels_by_id[task["level"]]
+        system = fill(self.prompts["worker"], language=LANG_NAMES[task["language"]],
+                      level_name=lv["name"], level_rules=lv["rules"], subject=task["subject"],
+                      topic=task["topic"], rules=self._subject_rules(task["subject"]),
+                      profile=task["profile"])
+        engines = self._live()
+        if not engines:
+            raise RuntimeError("Муҳаррики фаъол нест.")
+        results = []
+        with ThreadPoolExecutor(max_workers=len(engines)) as pool:
+            futs = {pool.submit(e.ask, system, task["clean_query"]): e for e in engines}
+            for fut in as_completed(futs):
+                e = futs[fut]
+                try:
+                    results.append({"engine": e.name, "response": fut.result()})
+                except Exception as ex:  # noqa: BLE001
+                    log.warning("%s хато дод: %s", e.name, ex)
+        if not results:
+            raise RuntimeError("Ҳеҷ муҳаррик ҷавоб надод.")
+        return results
+
+    # — 3+4: санҷиш ва ҷавоби ниҳоӣ
+    def finalize(self, task, answers, checks):
+        lv = self.levels_by_id[task["level"]]
+        bundle = "\n\n".join(f"=== {a['engine']} ===\n{a['response']}" for a in answers)
+        if len(answers) == 1:
+            bundle += "\n\n(Диққат: танҳо як манбаъ. Мустақилона санҷ.)"
+        sym = ""
+        if checks:
+            sym = "\n\nНАТИҶАИ SYMPY (ҳисоби компютерӣ):\n" + "\n".join(
+                f"- {c['kind']}({c['input']}) = {c['result']}" for c in checks)
+        user = f"САВОЛ:\n{task['clean_query']}\n\nҶАВОБҲОИ МОДЕЛҲО:\n{bundle}{sym}"
+        system = fill(self.prompts["judge"], language=LANG_NAMES[task["language"]],
+                      level_name=lv["name"], level_rules=lv["rules"], profile=task["profile"])
+        return self._ask_any(system, user, prefer="analysis")
+
+    def lesson(self, raw, lang_override=""):
+        task = self.analyze(raw, self.lang(lang_override))
+        log.info("Фанн=%s мавзӯъ=%s дараҷа=%s забон=%s", task["subject"], task["topic"],
+                 task["level"], task["language"])
+        task["profile"] = self.mem.profile(self.student, task["subject"], task["topic"])
+        self.mem.touch_topic(self.student, task["subject"], task["topic"])
+        self.mem.add_message(self.student, "user", raw, task["subject"], task["topic"])
+        checks = self.verify_math(task) if task["subject"] == "math" else []
+        answers = self.dispatch(task)
+        final = self.finalize(task, answers, checks)
+        self.mem.add_message(self.student, "assistant", final, task["subject"], task["topic"])
+        self.last = task
+        return final, task
+
+    # — мини-санҷиш ва кор бо хатоҳо
+    def make_quiz(self, subject, topic, lang, level, n=3):
+        mist = self.mem.open_mistakes(self.student, topic, 3)
+        payload = {"subject": subject, "topic": topic, "n": n, "language": LANG_NAMES[lang],
+                   "level": self.levels_by_id[level]["name"], "level_rules": self.levels_by_id[level]["rules"],
+                   "past_mistakes": [{"q": m["question"], "wrong": m["given"], "right": m["right"]}
+                                     for m in mist]}
+        data = extract_json(self._ask_any(self.prompts["quiz"], json.dumps(payload, ensure_ascii=False),
+                                          prefer="analysis"))
+        items = data.get("questions", []) if isinstance(data, dict) else data
+        return [i for i in items if isinstance(i, dict) and i.get("q") and i.get("a")][:n]
+
+    def grade(self, subject, item, given):
+        if subject == "math":
+            eq = answers_equal(given, str(item["a"]))
+            if eq is not None:
+                return {"correct": eq, "right_answer": str(item["a"]),
+                        "explanation": item.get("explain", "")}
+        payload = json.dumps({"q": item["q"], "expected": item["a"], "given": given},
+                             ensure_ascii=False)
+        try:
+            r = extract_json(self._ask_any(self.prompts["grade"], payload, prefer="language"))
+            return {"correct": bool(r.get("correct")),
+                    "right_answer": r.get("right_answer") or str(item["a"]),
+                    "explanation": r.get("explanation") or item.get("explain", "")}
+        except Exception:  # noqa: BLE001
+            ok = given.strip().lower() == str(item["a"]).strip().lower()
+            return {"correct": ok, "right_answer": str(item["a"]),
+                    "explanation": item.get("explain", "")}
+
+    def _cur_level(self):
+        lid = self.mem.student(self.student)["level"]
+        return lid if lid in self.levels_by_id else (self.last["level"] if self.last else "bakalavr")
+
+    def quiz(self, subject, topic, n=3, ask=input, say=print):
+        lang = self.last["language"] if self.last else (self.lang() or "tg")
+        ui = UI.get(lang, UI["en"])
+        try:
+            items = self.make_quiz(subject, topic, lang, self._cur_level(), n)
+        except Exception as ex:  # noqa: BLE001
+            say(f"Санҷиш сохта нашуд: {ex}")
+            return None
+        if not items:
+            say("Санҷиш сохта нашуд.")
+            return None
+        score, wrong = 0, []
+        say(f"\n📝 {subject}/{topic} {ui['hint']}")
+        for i, item in enumerate(items, 1):
+            say(f"\n{i}/{len(items)}. {item['q']}")
+            given = ask("> ").strip()
+            if given in ("", "-"):
+                res = {"correct": False, "right_answer": str(item["a"]),
+                       "explanation": item.get("explain", "")}
+            else:
+                res = self.grade(subject, item, given)
+            self.mem.record_result(self.student, subject, topic, res["correct"])
+            if res["correct"]:
+                score += 1
+                self.mem.resolve_one(self.student, topic)
+                say(ui["ok"])
+            else:
+                self.mem.add_mistake(self.student, subject, topic, item["q"], given,
+                                     res["right_answer"], res["explanation"])
+                wrong.append({"q": item["q"], "given": given, "right": res["right_answer"]})
+                say(f"{ui['bad']} {ui['right']}: {res['right_answer']}. {res['explanation']}")
+        row = self.mem.topic_row(self.student, subject, topic)
+        say("\n" + ui["score"].format(score, len(items)) + f" | {ui['mastery']}: {row['mastery']:.0%}")
+        if wrong:
+            try:
+                say("\n" + self._ask_any(fill(self.prompts["remediate"], language=LANG_NAMES[lang]),
+                                         json.dumps(wrong, ensure_ascii=False), prefer="analysis"))
+            except Exception as ex:  # noqa: BLE001
+                log.warning("Таҳлили хатоҳо нашуд: %s", ex)
+        return score, len(items)
+
+    def review(self, ask=input, say=print):
+        lang = self.lang() or "tg"
+        due = self.mem.due_topics(self.student)
+        if not due:
+            say(UI.get(lang, UI["en"])["nothing"])
+            return None
+        t = due[0]
+        say(f"🔁 {t['subject']}/{t['topic']} ({t['mastery']:.0%})")
+        return self.quiz(t["subject"], t["topic"], 3, ask, say)
+
+    def progress(self, say=print):
+        topics = self.mem.all_topics(self.student)
+        if not topics:
+            say("Ҳоло маълумот нест.")
+            return
+        for t in topics:
+            bar = "█" * int(t["mastery"] * 10) + "░" * (10 - int(t["mastery"] * 10))
+            say(f"{t['subject']}/{t['topic']:<24} {bar} {t['mastery']:.0%} "
+                f"| дарс {t['lessons']} | санҷиш {t['correct']}/{t['attempts']}")
+        say(f"Хатоҳои ҳалнашуда: {len(self.mem.open_mistakes(self.student, limit=100))}")
+
+
+# ───────────────────────── 6. Интерфейси сатри фармон ─────────────────────────
+ALIASES = {"санҷиш": "quiz", "такрор": "review", "пешрафт": "progress", "забон": "lang",
+           "дараҷа": "level", "хонанда": "student", "баромад": "exit"}
+
+
+def offer_quiz(app, task):
+    ui = UI.get(task["language"], UI["en"])
+    if input("\n" + ui["offer"] + " ").strip().lower() in YES:
+        app.quiz(task["subject"], task["topic"])
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("text", nargs="?", help="матни савол")
+    p.add_argument("--audio", help="файли овозӣ (mp3/wav/m4a)")
+    p.add_argument("--lang", default="", help="забони ҷавоб: tg/ru/uz/en")
+    p.add_argument("--student", default="default", help="номи хонанда (хотира ба ҳамин вобаста аст)")
+    p.add_argument("--level", default="", help="дараҷа: 1..11, bakalavr, magistr, phd")
+    p.add_argument("--db", default="omnimind.db")
+    p.add_argument("--quiz", action="store_true", help="пас аз ҷавоб мини-санҷиш")
+    a = p.parse_args()
+
+    app = OmniMind(a.db, a.student, a.level)
+    if a.audio or a.text:
+        text = transcribe_audio(a.audio) if a.audio else a.text
+        if a.audio:
+            print(f"[Матн аз овоз]: {text}\n")
+        answer, task = app.lesson(text, a.lang)
+        print(answer)
+        if a.quiz:
+            app.quiz(task["subject"], task["topic"])
+        return
+
+    print(f"Хонанда: {app.student}. Савол нависед.\n"
+          "Фармонҳо: /санҷиш /такрор /пешрафт /забон /дараҷа /хонанда /баромад")
+    while True:
+        try:
+            q = input("\n> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not q:
+            continue
+        if q.startswith("/"):
+            cmd, _, arg = q[1:].partition(" ")
+            cmd, arg = ALIASES.get(cmd, cmd), arg.strip()
+            if cmd in ("exit", "quit"):
+                break
+            elif cmd == "progress":
+                app.progress()
+            elif cmd == "review":
+                app.review()
+            elif cmd == "lang" and arg in LANG_NAMES:
+                app.mem.set_lang(app.student, arg)
+                print(f"Забони ҷавоб: {arg}")
+            elif cmd == "level":
+                if arg and app.set_level(arg):
+                    print(f"Дараҷа: {app.levels_by_id[app.parse_level(arg)]['name']}")
+                else:
+                    print("Дараҷаҳо: " + app.level_list() + "\nМисол: /дараҷа 3  ё  /дараҷа bakalavr")
+            elif cmd == "student" and arg:
+                app.set_student(arg)
+                print(f"Хонанда: {arg}")
+            elif cmd == "quiz":
+                if arg:
+                    subj, _, topic = arg.partition("/")
+                    app.quiz(subj, topic or "general")
+                elif app.last:
+                    app.quiz(app.last["subject"], app.last["topic"])
+                else:
+                    print("Аввал савол диҳед ё нависед: /санҷиш math/derivatives")
+            else:
+                print("Фармони номаълум.")
+            continue
+        try:
+            answer, task = app.lesson(q, a.lang)
+        except Exception as ex:  # noqa: BLE001
+            print(f"Хато: {ex}")
+            continue
+        print("\n" + answer)
+        offer_quiz(app, task)
+
+
+if __name__ == "__main__":
+    main()
