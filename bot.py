@@ -3,7 +3,6 @@ import os
 import telebot
 from omnimind import OmniMind
 
-# Telegram tokeningizni muhit o'zgaruvchisidan o'qiymiz
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TOKEN:
     raise ValueError("TELEGRAM_TOKEN muhit o'zgaruvchisi topilmadi!")
@@ -41,4 +40,5 @@ def handle_message(message):
 
 if __name__ == "__main__":
     print("Telegram bot ishga tushmoqda...")
-    bot.infinity_polling()
+    # SQLite xatosini oldini olish uchun threaded=False qo'shildi
+    bot.infinity_polling(threaded=False)
