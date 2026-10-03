@@ -1,0 +1,60 @@
+[
+  {
+    "name": "Claude",
+    "kind": "anthropic",
+    "model": "claude-sonnet-5-5",
+    "model_env": "ANTHROPIC_MODEL",
+    "key_env": "ANTHROPIC_API_KEY",
+    "strengths": ["analysis", "language", "writing"],
+    "enabled": true
+  },
+  {
+    "name": "DeepSeek",
+    "kind": "openai_compat",
+    "model": "deepseek-chat",
+    "model_env": "DEEPSEEK_MODEL",
+    "key_env": "DEEPSEEK_API_KEY",
+    "url": "https://api.deepseek.com/chat/completions",
+    "strengths": ["math", "logic", "code"],
+    "enabled": true
+  },
+  {
+    "name": "Gemini",
+    "kind": "gemini",
+    "model": "gemini-2.5-flash",
+    "model_env": "GEMINI_MODEL",
+    "key_env": "GEMINI_API_KEY",
+    "strengths": ["general", "language"],
+    "enabled": true
+  },
+  {
+    "name": "Groq",
+    "kind": "openai_compat",
+    "model": "",
+    "model_env": "GROQ_MODEL",
+    "key_env": "GROQ_API_KEY",
+    "url": "https://api.groq.com/openai/v1/chat/completions",
+    "strengths": ["math", "logic"],
+    "enabled": true
+  },
+  {
+    "name": "OpenRouter",
+    "kind": "openai_compat",
+    "model": "",
+    "model_env": "OPENROUTER_MODEL",
+    "key_env": "OPENROUTER_API_KEY",
+    "url": "https://openrouter.ai/api/v1/chat/completions",
+    "strengths": ["general"],
+    "enabled": true
+  },
+  {
+    "name": "Mistral",
+    "kind": "openai_compat",
+    "model": "",
+    "model_env": "MISTRAL_MODEL",
+    "key_env": "MISTRAL_API_KEY",
+    "url": "https://api.mistral.ai/v1/chat/completions",
+    "strengths": ["language", "general"],
+    "enabled": true
+  }
+]
